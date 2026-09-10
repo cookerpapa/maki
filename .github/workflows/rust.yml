@@ -2,7 +2,7 @@ name: Rust
 
 on:
   push:
-    branches: ["main"]
+    branches: ["validation/opencode-usage-limit-errors"]
   pull_request:
     branches: ["main"]
 
