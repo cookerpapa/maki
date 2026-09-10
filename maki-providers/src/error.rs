@@ -3,10 +3,20 @@
 //! channel closed, user cancel. `user_message()` returns human-readable text for each variant.
 
 use isahc::AsyncReadResponseExt;
+use serde_json::Value;
 
 /// Request fields that cap the *output*. A 400 naming one of them is about the
 /// cap we sent, never about the prompt being too big.
 const OUTPUT_CAP_FIELDS: [&str; 3] = ["max_tokens", "max_completion_tokens", "max_output_tokens"];
+const OPENCODE_USAGE_ERROR_TYPES: [&str; 6] = [
+    "CreditsError",
+    "MonthlyLimitError",
+    "UserLimitError",
+    "FreeUsageLimitError",
+    "GoUsageLimitError",
+    "BlackUsageLimitError",
+];
+const USAGE_LIMIT_MESSAGE: &str = "provider usage limit reached";
 
 #[derive(Debug, thiserror::Error)]
 pub enum AgentError {
@@ -99,7 +109,29 @@ impl AgentError {
     }
 
     pub fn is_auth_error(&self) -> bool {
-        matches!(self, Self::Api { status: 401, .. })
+        matches!(self, Self::Api { status: 401, .. }) && self.usage_limit_message().is_none()
+    }
+
+    // OpenCode also returns 401 for billing limits; logging in cannot resolve them.
+    fn usage_limit_message(&self) -> Option<String> {
+        let Self::Api {
+            status: 401 | 429,
+            message,
+        } = self
+        else {
+            return None;
+        };
+        let body: Value = serde_json::from_str(message).ok()?;
+        if !OPENCODE_USAGE_ERROR_TYPES.contains(&body.pointer("/error/type")?.as_str()?) {
+            return None;
+        }
+        Some(
+            body.pointer("/error/message")
+                .and_then(Value::as_str)
+                .filter(|message| !message.trim().is_empty())
+                .unwrap_or(USAGE_LIMIT_MESSAGE)
+                .to_owned(),
+        )
     }
 
     pub fn should_rotate_key(&self) -> bool {
@@ -107,6 +139,9 @@ impl AgentError {
     }
 
     pub fn user_message(&self) -> String {
+        if let Some(message) = self.usage_limit_message() {
+            return message;
+        }
         match self {
             Self::Config { message } => message.clone(),
             Self::Api { status: 429, .. } => "rate limited, try again in a moment".into(),
@@ -138,6 +173,9 @@ impl AgentError {
     }
 
     pub fn retry_message(&self) -> String {
+        if let Some(message) = self.usage_limit_message() {
+            return message;
+        }
         match self {
             Self::Api { status: 429, .. } => "Rate limited".into(),
             Self::Api { status: 529, .. } => "Provider is overloaded".into(),
@@ -171,7 +209,10 @@ impl From<maki_storage::StorageError> for AgentError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use test_case::test_case;
+
+    const QUOTA_MESSAGE: &str = "Weekly usage limit reached. Resets in 3 hours.";
 
     fn api(status: u16) -> AgentError {
         AgentError::Api {
@@ -200,6 +241,40 @@ mod tests {
     #[test_case(403, false ; "forbidden")]
     fn api_auth_error(status: u16, expected: bool) {
         assert_eq!(api(status).is_auth_error(), expected);
+    }
+
+    #[test_case("CreditsError", 401 ; "credits")]
+    #[test_case("MonthlyLimitError", 401 ; "monthly_limit")]
+    #[test_case("UserLimitError", 401 ; "user_limit")]
+    #[test_case("GoUsageLimitError", 401 ; "go_unauthorized")]
+    #[test_case("GoUsageLimitError", 429 ; "go_rate_limit")]
+    #[test_case("BlackUsageLimitError", 429 ; "black_rate_limit")]
+    #[test_case("FreeUsageLimitError", 429 ; "free_rate_limit")]
+    fn opencode_usage_limits_preserve_details(error_type: &str, status: u16) {
+        let body = json!({"error": {"type": error_type, "message": QUOTA_MESSAGE}});
+        let err = api_msg(status, &body.to_string());
+
+        assert!(!err.is_auth_error());
+        assert_eq!(err.user_message(), QUOTA_MESSAGE);
+        assert_eq!(err.retry_message(), QUOTA_MESSAGE);
+        assert_eq!(err.is_retryable(), status == 429);
+    }
+
+    #[test_case(json!({"type": "GoUsageLimitError"}) ; "missing_message")]
+    #[test_case(json!({"type": "GoUsageLimitError", "message": " "}) ; "empty_message")]
+    fn usage_limit_without_message_does_not_request_login(error: Value) {
+        let err = api_msg(401, &json!({"error": error}).to_string());
+
+        assert!(!err.is_auth_error());
+        assert_eq!(err.user_message(), USAGE_LIMIT_MESSAGE);
+    }
+
+    #[test_case(r#"{"error":{"type":"AuthError","message":"Invalid API key"}}"# ; "auth_error")]
+    #[test_case(r#"{"error":{"type":"UnknownError","message":"quota"}}"# ; "unknown_type")]
+    #[test_case(r#"{"message":"quota exceeded"}"# ; "untyped_message")]
+    #[test_case("not JSON" ; "malformed_body")]
+    fn other_unauthorized_errors_still_request_login(body: &str) {
+        assert!(api_msg(401, body).is_auth_error());
     }
 
     #[test_case(429, "Rate limited"        ; "rate_limited")]
