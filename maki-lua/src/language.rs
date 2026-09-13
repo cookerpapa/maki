@@ -5,6 +5,7 @@ pub enum Language {
     Rust,
     Python,
     TypeScript,
+    Tsx,
     JavaScript,
     Gleam,
     Go,
@@ -43,6 +44,7 @@ impl Language {
             "rust" => Some(Self::Rust),
             "python" => Some(Self::Python),
             "typescript" => Some(Self::TypeScript),
+            "tsx" => Some(Self::Tsx),
             "javascript" => Some(Self::JavaScript),
             "gleam" => Some(Self::Gleam),
             "go" => Some(Self::Go),
@@ -81,7 +83,8 @@ impl Language {
         match ext {
             "rs" => Some(Self::Rust),
             "py" | "pyi" => Some(Self::Python),
-            "ts" | "tsx" => Some(Self::TypeScript),
+            "ts" => Some(Self::TypeScript),
+            "tsx" => Some(Self::Tsx),
             "js" | "jsx" | "mjs" | "cjs" => Some(Self::JavaScript),
             "gleam" => Some(Self::Gleam),
             "go" => Some(Self::Go),
@@ -121,6 +124,7 @@ impl Language {
             Self::Rust => tree_sitter_rust::LANGUAGE.into(),
             Self::Python => tree_sitter_python::LANGUAGE.into(),
             Self::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            Self::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
             Self::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
             Self::Gleam => tree_sitter_gleam::LANGUAGE.into(),
             Self::Go => tree_sitter_go::LANGUAGE.into(),
@@ -152,5 +156,32 @@ impl Language {
             Self::Json => tree_sitter_json::LANGUAGE.into(),
             Self::Make => tree_sitter_make::LANGUAGE.into(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use test_case::test_case;
+    use tree_sitter::Parser;
+
+    use super::Language;
+
+    const JSX_SOURCE: &str = "export const x = <T a={<B c={d} />} />;";
+    const TYPESCRIPT_SOURCE: &str =
+        "const x = <number>value; const identity = <T>(value: T): T => value;";
+
+    #[test_case("tsx", JSX_SOURCE; "tsx_nested_attributes")]
+    #[test_case("jsx", JSX_SOURCE; "jsx_nested_attributes")]
+    #[test_case("ts", TYPESCRIPT_SOURCE; "typescript_angle_assertion_and_generic_arrow")]
+    fn extension_selects_valid_grammar(extension: &str, source: &str) {
+        let language = Language::from_extension(extension).unwrap();
+        let mut parser = Parser::new();
+        parser.set_language(&language.ts_language()).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        assert!(
+            !tree.root_node().has_error(),
+            "{}",
+            tree.root_node().to_sexp()
+        );
     }
 }
