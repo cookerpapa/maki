@@ -7,7 +7,7 @@ local EXT_TO_LANG = {
   py = "python",
   pyi = "python",
   ts = "typescript",
-  tsx = "typescript",
+  tsx = "tsx",
   js = "javascript",
   jsx = "javascript",
   mjs = "javascript",
@@ -74,7 +74,6 @@ local FILENAME_TO_LANG = {
 
 local LANG_TO_PARSER = {
   lua_lang = "lua",
-  javascript = "typescript",
   bazel_build = "starlark",
   bazel_module = "starlark",
   bazel_bzl = "starlark",
@@ -852,6 +851,7 @@ end
 
 local LANG_ALIASES = {
   javascript = "typescript",
+  tsx = "typescript",
 }
 
 local KNOWN_LANGS = {}

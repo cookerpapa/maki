@@ -8,7 +8,7 @@ return function(U)
   end
 
   local function class_member_sig(node, source)
-    local mn_node = node:field("name")[1]
+    local mn_node = node:field("name")[1] or node:field("property")[1]
     local mn = mn_node and U.get_text(mn_node, source) or "_"
     local params_node = node:field("parameters")[1]
     local params = params_node and U.get_text(params_node, source) or ""
@@ -56,7 +56,7 @@ return function(U)
           local lr = U.format_range(U.line_start(child), U.line_end(child))
           methods[#methods + 1] = U.ranged(sig, lr)
         end
-      elseif ckind == "public_field_definition" or ckind == "property_definition" then
+      elseif ckind == "public_field_definition" or ckind == "field_definition" then
         local counter = "field"
         field_counts[counter] = (field_counts[counter] or 0) + 1
         if field_counts[counter] <= U.FIELD_TRUNCATE_THRESHOLD then
