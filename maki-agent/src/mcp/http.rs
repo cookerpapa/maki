@@ -1,10 +1,10 @@
 use std::collections::HashMap;
-use std::io::Read;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use async_lock::Mutex;
+use futures_lite::AsyncReadExt;
 use isahc::HttpClient;
 use isahc::config::{Configurable, RedirectPolicy, VersionNegotiation};
 use isahc::http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
@@ -135,26 +135,26 @@ impl HttpTransport {
         http_req: Request<Vec<u8>>,
     ) -> Result<(StatusCode, HeaderMap, String), McpError> {
         let server = self.server();
-        smol::unblock({
-            let client = self.client.clone();
-            move || {
-                let mut response = client.send(http_req).map_err(|e| McpError::WriteFailed {
+        let mut response =
+            self.client
+                .send_async(http_req)
+                .await
+                .map_err(|e| McpError::WriteFailed {
                     server: server.clone(),
                     reason: e.to_string(),
                 })?;
-                let status = response.status();
-                let headers = response.headers().clone();
-                let mut body = String::new();
-                response.body_mut().read_to_string(&mut body).map_err(|e| {
-                    McpError::InvalidResponse {
-                        server,
-                        reason: e.to_string(),
-                    }
-                })?;
-                Ok((status, headers, body))
-            }
-        })
-        .await
+        let status = response.status();
+        let headers = response.headers().clone();
+        let mut body = String::new();
+        response
+            .body_mut()
+            .read_to_string(&mut body)
+            .await
+            .map_err(|e| McpError::InvalidResponse {
+                server,
+                reason: e.to_string(),
+            })?;
+        Ok((status, headers, body))
     }
 
     fn parse_rpc_response(&self, body_str: &str, is_sse: bool, id: u64) -> Result<Value, McpError> {
@@ -338,8 +338,7 @@ impl McpTransport for HttpTransport {
                 return;
             };
 
-            let client = self.client.clone();
-            let _ = smol::unblock(move || client.send(req)).await;
+            let _ = self.client.send_async(req).await;
         })
     }
 
@@ -432,13 +431,15 @@ fn parse_sse_events(body: &str) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_lite::future::race;
     use serde_json::json;
     use test_case::test_case;
 
     use maki_storage::auth::{McpAuthData, OAuthTokens, save_mcp_auth};
-    use std::io::{BufRead, BufReader, Write as IoWrite};
+    use std::io::{BufRead, BufReader, ErrorKind, Read, Write as IoWrite};
     use std::net::TcpListener;
     use std::sync::atomic::AtomicUsize;
+    use std::thread;
 
     const NOTIFICATION: &str =
         "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{}}\n\n";
@@ -465,6 +466,97 @@ mod tests {
     const NEGOTIATED_VERSION: &str = "2025-03-26";
     const OLD_BEARER: &str = "Bearer old-token";
     const NEW_BEARER: &str = "Bearer new-token";
+    const DISCONNECT_DEADLINE: Duration = Duration::from_secs(5);
+    const PENDING_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+    const PARTIAL_RESPONSE: &str = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 1024\r\nConnection: close\r\n\r\n{";
+
+    enum PendingOperation {
+        Request,
+        Notification,
+    }
+
+    #[test_case(PendingOperation::Request, false; "request_waiting_for_headers")]
+    #[test_case(PendingOperation::Request, true; "request_waiting_for_body")]
+    #[test_case(PendingOperation::Notification, false; "notification_waiting_for_headers")]
+    #[test_case(PendingOperation::Notification, true; "notification_waiting_for_body")]
+    fn dropping_http_operation_stops_receiving_response(
+        operation: PendingOperation,
+        started_body: bool,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let (ready_tx, ready_rx) = smol::channel::bounded(1);
+        let (respond_tx, respond_rx) = smol::channel::bounded(1);
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(DISCONNECT_DEADLINE)).unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut content_length = 0;
+            loop {
+                let mut line = String::new();
+                assert!(reader.read_line(&mut line).unwrap() > 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(length) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    content_length = length.trim().parse().unwrap();
+                }
+            }
+            let mut body = vec![0; content_length];
+            reader.read_exact(&mut body).unwrap();
+            if started_body {
+                stream.write_all(PARTIAL_RESPONSE.as_bytes()).unwrap();
+            }
+            ready_tx.try_send(()).unwrap();
+            respond_rx.recv_blocking().unwrap();
+
+            // isahc observes dropped requests when the transfer next makes progress.
+            let response = if started_body { " " } else { PARTIAL_RESPONSE };
+            let _ = stream.write_all(response.as_bytes());
+
+            match reader.read(&mut [0]) {
+                Ok(0) => true,
+                Err(error) if error.kind() == ErrorKind::ConnectionReset => true,
+                _ => false,
+            }
+        });
+
+        let transport =
+            HttpTransport::new("srv", &url, &HashMap::new(), PENDING_REQUEST_TIMEOUT, None)
+                .unwrap();
+        smol::block_on(async {
+            let pending: BoxFuture<'_, ()> = match operation {
+                PendingOperation::Request => Box::pin(async {
+                    let _ = transport.send_request("tools/call", None).await;
+                }),
+                PendingOperation::Notification => Box::pin(async {
+                    let _ = transport
+                        .send_notification("notifications/initialized", None)
+                        .await;
+                }),
+            };
+            let request_started = race(
+                async {
+                    pending.await;
+                    false
+                },
+                async {
+                    ready_rx.recv().await.unwrap();
+                    true
+                },
+            )
+            .await;
+            assert!(
+                request_started,
+                "operation ended before the server received it"
+            );
+        });
+        respond_tx.try_send(()).unwrap();
+        assert!(
+            server.join().unwrap(),
+            "dropped operation left its HTTP connection open"
+        );
+    }
 
     fn rpc_ok(id: u64) -> String {
         format!(r#"{{"jsonrpc":"2.0","id":{id},"result":{{"ok":true}}}}"#)
