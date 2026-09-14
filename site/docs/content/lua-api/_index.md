@@ -2188,6 +2188,7 @@ maki.fs.read({path})
 ```
 
 Read the entire file at {path} as a UTF-8 string.
+Files larger than 1 GiB return nil plus an error message.
 If the file contains bytes that are not valid UTF-8, this function throws.
 Use `read_bytes` for binary files.
 
@@ -2218,6 +2219,7 @@ maki.fs.read_bytes({path})
 ```
 
 Read the entire file at {path} as raw bytes, returned as a Luau buffer.
+Files larger than 1 GiB return nil plus an error message.
 Useful for binary files or when you need to pass the data to `maki.base64.encode`.
 
 Requires the `fs_read` [plugin permission](#plugin-permissions).
