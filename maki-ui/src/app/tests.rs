@@ -15,19 +15,22 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventK
 use maki_agent::permissions::PermissionManager;
 use maki_agent::{
     DoneReason, ImageMediaType, McpConfigErrors, McpServerInfo, McpServerStatus, McpSnapshot,
-    McpSnapshotReader, ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteEvent,
+    McpSnapshotReader, SharedBuf, ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteEvent,
 };
 use maki_config::{Effect, PermissionRule, PermissionsConfig, ProjectConfig, ToolKey, UiConfig};
 use maki_lua::test_support::{HintWriterHandle, hint_writer_pair};
 use maki_lua::{
-    BuiltinAction, HintReader, KeymapReader, LuaCommandInfo, LuaCommandReader, PackCommand,
-    PackPlan, PackPreparation, PackReport, SessionEndReason,
+    BuiltinAction, Dimension, FloatConfig, HintReader, KeymapReader, LuaCommandInfo,
+    LuaCommandReader, PackCommand, PackPlan, PackPreparation, PackReport, SessionEndReason, Split,
+    WinCommand, WinEvent,
 };
 use maki_providers::{
     ContentBlock, Effort, Message, RequestOptions, Role, THINKING_USAGE, TokenUsage,
 };
 use maki_storage::sessions::{SessionMeta, StoredMode, StoredThinking};
 use maki_storage::trusted_folders::{CanonicalFolder, TrustedFolders};
+use ratatui::Terminal;
+use ratatui::backend::TestBackend;
 use ratatui::layout::Rect;
 use ratatui::style::Modifier;
 use std::env;
@@ -79,6 +82,7 @@ const AGENT_ERROR_MSG: &str = "boom";
 const MULTIBYTE_ERROR_CHAR: &str = "é";
 const TRUST: &str = "/trust";
 const GATED_INIT_SOURCE: &str = "-- shipped by the project";
+const PREVIOUS_ANSWER: &str = "Previous answer to select";
 
 fn set_zone(app: &mut App, zone: SelectionZone, area: Rect) {
     app.zones.push(SelectableZone { area, zone });
@@ -4752,6 +4756,84 @@ fn attention_float_marks_app_as_awaiting_input_until_close() {
     let _ = app.float_mgr.tick();
     assert!(!app.awaiting_input());
     assert_eq!(app.attention(), None);
+}
+
+#[test_case(Split::Below ; "below_question")]
+#[test_case(Split::Above ; "above")]
+#[test_case(Split::Left ; "left")]
+#[test_case(Split::Right ; "right")]
+fn split_question_keeps_transcript_selectable_and_keyboard_focus(dir: Split) {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    app.update(agent_msg(AgentEvent::TextDelta {
+        text: PREVIOUS_ANSWER.into(),
+    }));
+    app.update(done_event());
+
+    let config = FloatConfig {
+        width: Dimension::Abs(SPLIT_EXTENT),
+        height: Dimension::Abs(SPLIT_EXTENT),
+        split: dir,
+        needs_input: true,
+        ..FloatConfig::default()
+    };
+    let (event_tx, event_rx) = flume::bounded::<WinEvent>(8);
+    let (_cmd_tx, cmd_rx) = flume::bounded::<WinCommand>(8);
+    app.float_mgr
+        .open(Arc::new(SharedBuf::new()), config, true, event_tx, cmd_rx);
+
+    let backend = TestBackend::new(TEST_AREA.width, TEST_AREA.height);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| {
+            app.view(frame);
+        })
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+    let start = buffer
+        .content()
+        .iter()
+        .position(|cell| cell.symbol() == &PREVIOUS_ANSWER[..1])
+        .unwrap();
+    let (col, row) = buffer.pos_of(start);
+    let end_col = col + PREVIOUS_ANSWER.len() as u16 - 1;
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        col,
+        row,
+    ));
+    app.update(mouse_event(
+        MouseEventKind::Drag(MouseButton::Left),
+        end_col,
+        row,
+    ));
+    app.update(mouse_event(
+        MouseEventKind::Up(MouseButton::Left),
+        end_col,
+        row,
+    ));
+
+    let state = app
+        .selection_state
+        .as_ref()
+        .expect("transcript selection while answering");
+    assert!(state.is_pending_copy());
+    let sel = state.sel();
+    assert_eq!(sel.zone, SelectionZone::Messages);
+    assert_eq!(
+        app.chats[0].extract_selection_text(sel, app.msg_area()),
+        PREVIOUS_ANSWER
+    );
+
+    app.update(Msg::Key(key(KeyCode::Char('j'))));
+    assert!(
+        event_rx
+            .try_iter()
+            .any(|event| matches!(event, WinEvent::Key { key } if key == "j"))
+    );
+    assert!(app.input_box.is_empty());
+    assert!(app.awaiting_input());
 }
 
 #[test]

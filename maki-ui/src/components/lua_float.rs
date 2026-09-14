@@ -693,6 +693,12 @@ impl Overlay for FloatManager {
         self.focused_id.is_some()
     }
 
+    fn is_modal(&self) -> bool {
+        self.windows
+            .iter()
+            .any(|win| win.config.split == Split::None)
+    }
+
     fn close(&mut self) {
         self.close_all();
     }
@@ -1091,6 +1097,24 @@ mod tests {
         assert_eq!(mgr.windows.len(), 2);
         assert_eq!(mgr.windows[0].config.zindex, 10);
         assert_eq!(mgr.windows[1].config.zindex, 90);
+    }
+
+    #[test]
+    fn focused_split_preserves_an_existing_modal_until_it_closes() {
+        let mut mgr = FloatManager::new();
+        let (_events, modal_commands) = open_with_lines(&mut mgr, &[PASTE_TEXT]);
+        let (event_tx, cmd_rx, _event_rx, _cmd_tx) = make_channels();
+        let split = FloatConfig {
+            split: Split::Below,
+            ..make_config()
+        };
+        mgr.open(make_buf(&[PASTE_TEXT]), split, true, event_tx, cmd_rx);
+        assert!(mgr.is_modal());
+
+        modal_commands.send(WinCommand::Close).unwrap();
+        let _ = mgr.tick();
+        assert!(Overlay::is_open(&mgr));
+        assert!(!mgr.is_modal());
     }
 
     #[test]
