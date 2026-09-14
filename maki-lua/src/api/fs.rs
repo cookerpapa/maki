@@ -1,7 +1,7 @@
 use std::cmp::Reverse;
 use std::collections::HashSet;
-use std::fs::FileType;
-use std::io::ErrorKind;
+use std::fs::{File, FileType};
+use std::io::{Error as IoError, ErrorKind, Read, Result as IoResult};
 use std::path::{Component, Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -11,6 +11,11 @@ use mlua::{Buffer, Lua, Result as LuaResult, Table, Value};
 use crate::api::util::convert::opt_bool;
 use crate::api::util::pair::{Pair, err_pair, pair, try_pair};
 use crate::plugin_permissions::PluginPermissions;
+use crate::runtime::LUA_MEMORY_LIMIT;
+
+// Luau allows strings and buffers up to 1 GiB, but the VM budget is the binding
+// limit: a read the VM cannot hold dies with a Lua memory error instead.
+const MAX_READ_BYTES: u64 = LUA_MEMORY_LIMIT as u64;
 
 pub(crate) fn expand_tilde(path: &str) -> PathBuf {
     maki_storage::paths::expand_tilde(Path::new(path))
@@ -84,7 +89,33 @@ fn collect_dir_entries(
     }
 }
 
+async fn read_file(path: PathBuf, max_bytes: u64) -> IoResult<Vec<u8>> {
+    smol::unblock(move || {
+        let too_large = || {
+            IoError::new(
+                ErrorKind::FileTooLarge,
+                format!("file exceeds the {max_bytes}-byte read limit"),
+            )
+        };
+        let file = File::open(path)?;
+        let size = file.metadata()?.len();
+        if size > max_bytes {
+            return Err(too_large());
+        }
+
+        // Files can grow, and some streams report a size of zero.
+        let mut bytes = Vec::with_capacity(size as usize);
+        file.take(max_bytes + 1).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > max_bytes {
+            return Err(too_large());
+        }
+        Ok(bytes)
+    })
+    .await
+}
+
 /// Read the entire file at {path} as a UTF-8 string.
+/// Files larger than 512 MiB return nil plus an error message.
 /// If the file contains bytes that are not valid UTF-8, this function throws.
 /// Use `read_bytes` for binary files.
 ///
@@ -99,16 +130,15 @@ fn collect_dir_entries(
 #[lua_fn(guard = FsRead)]
 async fn read(_lua: Lua, path: String) -> LuaResult<Pair<String>> {
     let abs = make_absolute(&path)?;
-    match smol::fs::read_to_string(&abs).await {
+    let bytes = try_pair!(read_file(abs, MAX_READ_BYTES).await);
+    match String::from_utf8(bytes) {
         Ok(s) => Ok((Some(s), None)),
-        Err(e) if e.kind() == ErrorKind::InvalidData => {
-            Err(mlua::Error::runtime("non-utf8 content; use read_bytes"))
-        }
-        Err(e) => Ok(err_pair(e)),
+        Err(_) => Err(mlua::Error::runtime("non-utf8 content; use read_bytes")),
     }
 }
 
 /// Read the entire file at {path} as raw bytes, returned as a Luau buffer.
+/// Files larger than 512 MiB return nil plus an error message.
 /// Useful for binary files or when you need to pass the data to `maki.base64.encode`.
 ///
 /// @param path string Absolute or relative file path. `~/` is expanded to the home directory.
@@ -120,7 +150,7 @@ async fn read(_lua: Lua, path: String) -> LuaResult<Pair<String>> {
 #[lua_fn(guard = FsRead)]
 async fn read_bytes(lua: Lua, path: String) -> LuaResult<Pair<Buffer>> {
     let abs = make_absolute(&path)?;
-    let bytes = try_pair!(smol::fs::read(&abs).await);
+    let bytes = try_pair!(read_file(abs, MAX_READ_BYTES).await);
     Ok((Some(lua.create_buffer(bytes)?), None))
 }
 
@@ -715,6 +745,10 @@ mod tests {
     const FIRST_CONTENT: &str = "first";
     const REPLACEMENT_CONTENT: &str = "replacement";
     const FS_WRITE_PERMISSION: &str = "fs_write";
+    #[cfg(unix)]
+    const READ_LIMIT_ERROR: &str = "file exceeds the 536870912-byte read limit";
+    const NON_UTF8_ERROR: &str = "non-utf8 content; use read_bytes";
+    const TEST_READ_LIMIT: u64 = 4;
 
     #[test]
     fn read_file_ok() {
@@ -744,6 +778,76 @@ mod tests {
                 "{func_name} should return error"
             );
         }
+    }
+
+    // Sparse files keep these oversized-file tests cheap on Unix filesystems.
+    #[cfg(unix)]
+    #[test_case("read"; "text")]
+    #[test_case("read_bytes"; "binary")]
+    fn oversized_read_returns_nil_err(func_name: &str) {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("oversized");
+        let file = File::create(&path).unwrap();
+        file.set_len(MAX_READ_BYTES + 1).unwrap();
+
+        let lua = Lua::new();
+        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
+        let f: mlua::Function = tbl.get(func_name).unwrap();
+        let (value, err): (Value, Option<String>) =
+            smol::block_on(f.call_async(path.to_str().unwrap())).unwrap();
+        assert_eq!(value, Value::Nil);
+        assert_eq!(err.as_deref(), Some(READ_LIMIT_ERROR));
+    }
+
+    #[test_case(b""; "empty")]
+    #[test_case(b"abc"; "below_limit")]
+    #[test_case(b"abcd"; "at_limit")]
+    fn bounded_read_accepts_contents_within_limit(contents: &[u8]) {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("bounded");
+        std::fs::write(&path, contents).unwrap();
+
+        let bytes = smol::block_on(read_file(path, TEST_READ_LIMIT)).unwrap();
+        assert_eq!(bytes, contents);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_read_limits_stream_with_zero_reported_size() {
+        let path = PathBuf::from("/dev/zero");
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+
+        let err = smol::block_on(read_file(path, TEST_READ_LIMIT)).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::FileTooLarge);
+    }
+
+    #[test_case(b""; "empty")]
+    #[test_case(b"\x00\xff\x80"; "non_utf8")]
+    fn read_bytes_preserves_binary_contents(contents: &[u8]) {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("binary");
+        std::fs::write(&path, contents).unwrap();
+
+        let lua = Lua::new();
+        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
+        let f: mlua::Function = tbl.get("read_bytes").unwrap();
+        let (buffer, err): (Buffer, Option<String>) =
+            smol::block_on(f.call_async(path.to_str().unwrap())).unwrap();
+        assert_eq!(buffer.to_vec(), contents);
+        assert_eq!(err, None);
+    }
+
+    #[test]
+    fn read_non_utf8_still_throws() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("binary");
+        std::fs::write(&path, b"\xff").unwrap();
+
+        let lua = Lua::new();
+        let tbl = create_fs_table(&lua, &PluginPermissions::trusted()).unwrap();
+        let f: mlua::Function = tbl.get("read").unwrap();
+        let err = smol::block_on(f.call_async::<Value>(path.to_str().unwrap())).unwrap_err();
+        assert!(err.to_string().contains(NON_UTF8_ERROR));
     }
 
     #[test]

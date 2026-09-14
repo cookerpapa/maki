@@ -115,7 +115,7 @@ const FINAL_DRAIN_BUDGET: usize = 256;
 const SESSION_END_EVENT: &str = "SessionEnd";
 /// Without a cap, a runaway plugin OOM-kills the whole process.
 /// With one, it hits a catchable Lua error instead.
-const LUA_MEMORY_LIMIT: usize = 512 * 1024 * 1024;
+pub(crate) const LUA_MEMORY_LIMIT: usize = 512 * 1024 * 1024;
 
 pub type LoadResult = Result<(), PluginError>;
 pub(crate) enum HintContent {
