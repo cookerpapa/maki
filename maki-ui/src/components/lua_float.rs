@@ -693,6 +693,12 @@ impl Overlay for FloatManager {
         self.focused_id.is_some()
     }
 
+    fn is_modal(&self) -> bool {
+        self.focused_id
+            .and_then(|id| self.windows.iter().find(|win| win.id == id))
+            .is_some_and(|win| win.config.split == Split::None)
+    }
+
     fn close(&mut self) {
         self.close_all();
     }
@@ -716,6 +722,8 @@ mod tests {
     const EXPECT_PASTE_TRUE: &str = "handle_paste should return true when focused";
     const EXPECT_PASTE_FALSE: &str = "handle_paste should return false with no focus";
     const PASTE_TEXT: &str = "hello";
+    const EXPECT_MODAL: &str = "expected a focused float to be modal";
+    const EXPECT_NOT_MODAL: &str = "expected a focused split to not be modal";
     const NO_STACK_OFFSET: u16 = 0;
 
     fn make_line(text: &str) -> SnapshotLine {
@@ -1091,6 +1099,35 @@ mod tests {
         assert_eq!(mgr.windows.len(), 2);
         assert_eq!(mgr.windows[0].config.zindex, 10);
         assert_eq!(mgr.windows[1].config.zindex, 90);
+    }
+
+    #[test]
+    fn unfocused_float_does_not_make_a_focused_split_modal() {
+        let mut mgr = FloatManager::new();
+        let (_float_events, _float_commands) = open_with_lines(&mut mgr, &[PASTE_TEXT]);
+        let (event_tx, cmd_rx, _event_rx, _cmd_tx) = make_channels();
+        let split = FloatConfig {
+            split: Split::Below,
+            ..make_config()
+        };
+        mgr.open(make_buf(&[PASTE_TEXT]), split, true, event_tx, cmd_rx);
+
+        assert!(Overlay::is_open(&mgr), "{EXPECT_OPEN}");
+        assert!(!mgr.is_modal(), "{EXPECT_NOT_MODAL}");
+    }
+
+    #[test]
+    fn focused_float_stays_modal_over_an_unfocused_split() {
+        let mut mgr = FloatManager::new();
+        let (event_tx, cmd_rx, _event_rx, _cmd_tx) = make_channels();
+        let split = FloatConfig {
+            split: Split::Below,
+            ..make_config()
+        };
+        mgr.open(make_buf(&[PASTE_TEXT]), split, true, event_tx, cmd_rx);
+        let (_float_events, _float_commands) = open_with_lines(&mut mgr, &[PASTE_TEXT]);
+
+        assert!(mgr.is_modal(), "{EXPECT_MODAL}");
     }
 
     #[test]
